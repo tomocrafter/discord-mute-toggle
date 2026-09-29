@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 const SCOPES: [&str; 3] = ["rpc", "rpc.voice.read", "rpc.voice.write"];
 const TOKEN_URL: &str = "https://discord.com/api/oauth2/token";
+/// アクセストークン (7 日) の期限がこれより近ければ、接続時に更新しておく
+const REFRESH_BEFORE: u64 = 24 * 60 * 60;
 
 #[derive(Deserialize)]
 struct Config {
@@ -196,11 +198,21 @@ fn connect(cfg: &Config) -> Result<Rpc> {
     let mut token = load_token();
 
     if let Some(t) = &token
-        && t.expires_at <= now() + 60
+        && t.expires_at <= now() + REFRESH_BEFORE
     {
-        token = refresh(cfg, t)
-            .inspect_err(|e| eprintln!("トークン更新失敗: {e:#}"))
-            .ok();
+        match refresh(cfg, t) {
+            Ok(new) => token = Some(new),
+            Err(e) if is_rejected(&e) => {
+                eprintln!("リフレッシュトークンが拒否された: {e:#}");
+                token = None;
+            }
+            // ネットワーク断 (スリープ復帰直後など) で認可ダイアログを出さない。
+            // まだ使えるならそのまま使い、期限切れなら次の接続でやり直す
+            Err(e) if t.expires_at > now() + 60 => {
+                eprintln!("トークン更新失敗 (期限前なので今のトークンを使う): {e:#}");
+            }
+            Err(e) => return Err(e.context("トークン更新失敗")),
+        }
     }
     if let Some(t) = &token {
         match rpc.command("AUTHENTICATE", json!({ "access_token": t.access_token })) {
@@ -211,6 +223,15 @@ fn connect(cfg: &Config) -> Result<Rpc> {
     let t = authorize(&mut rpc, cfg)?;
     rpc.command("AUTHENTICATE", json!({ "access_token": t.access_token }))?;
     Ok(rpc)
+}
+
+/// トークンエンドポイントがトークンを拒否した (= 認可し直すしかない) か。
+/// ネットワークエラーなど一時的な失敗とは区別する。
+fn is_rejected(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::StatusCode(400 | 401))
+    )
 }
 
 fn toggle_mute(rpc: &mut Rpc) -> Result<bool> {
