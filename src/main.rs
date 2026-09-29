@@ -188,11 +188,12 @@ fn connect(cfg: &Config) -> Result<Rpc> {
     let mut token = load_token();
 
     if let Some(t) = &token
-        && t.expires_at <= now() + 60 {
-            token = refresh(cfg, t)
-                .inspect_err(|e| eprintln!("トークン更新失敗: {e:#}"))
-                .ok();
-        }
+        && t.expires_at <= now() + 60
+    {
+        token = refresh(cfg, t)
+            .inspect_err(|e| eprintln!("トークン更新失敗: {e:#}"))
+            .ok();
+    }
     if let Some(t) = &token {
         match rpc.command("AUTHENTICATE", json!({ "access_token": t.access_token })) {
             Ok(_) => return Ok(rpc),
