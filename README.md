@@ -24,7 +24,7 @@ Reading keys on Wayland without the compositor's help means reading `/dev/input`
 - systemd creates the notification socket `/run/discord-mute-toggle.sock`, owned by your user with mode `0600`, so no other user can connect to it.
 - **discord-mute-toggle** runs as your user. It never touches `/dev/input`. It receives the notification, reads the current state with `GET_VOICE_SETTINGS`, and flips it with `SET_VOICE_SETTINGS`.
 
-Keyboards are rescanned every few seconds, so hot-plugged keyboards work without a restart. Every keyboard that has a Right Alt key is watched. If Discord restarts, the app reconnects on the next key press. The OAuth token is refreshed automatically.
+Keyboards are rescanned every few seconds, so hot-plugged keyboards work without a restart. Every keyboard that has a Right Alt key is watched. Nothing polls: keyd asks the kernel (`EVIOCSMASK`) to deliver only Right Alt events, so mouse movement and typing never wake it, and both processes use inotify to notice new keyboards and Discord starting up. When Discord (re)starts, the app connects right away, so the first key press is not delayed by authentication. The OAuth token is refreshed automatically.
 
 ## Requirements
 

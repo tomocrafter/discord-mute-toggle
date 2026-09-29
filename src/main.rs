@@ -3,6 +3,7 @@
 //! Discord RPC (IPC) 経由でマイクミュートをトグルする常駐アプリ。
 
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -10,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use anyhow::{Context, Result, anyhow, bail};
+use discord_mute_toggle::inotify::{IN_CREATE, Inotify};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -38,6 +40,12 @@ fn config_dir() -> PathBuf {
     base.join("discord-mute-toggle")
 }
 
+fn runtime_dir() -> PathBuf {
+    env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -60,9 +68,9 @@ struct Rpc {
 
 impl Rpc {
     fn open(client_id: &str) -> Result<Self> {
-        let runtime = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let runtime = runtime_dir();
         let sock = (0..10)
-            .find_map(|i| UnixStream::connect(format!("{runtime}/discord-ipc-{i}")).ok())
+            .find_map(|i| UnixStream::connect(runtime.join(format!("discord-ipc-{i}"))).ok())
             .ok_or_else(|| anyhow!("Discord の IPC ソケットが見つからない (Discord 未起動?)"))?;
         let mut rpc = Rpc { sock, nonce: 0 };
         rpc.write(OP_HANDSHAKE, &json!({ "v": 1, "client_id": client_id }))?;
@@ -216,8 +224,15 @@ fn toggle_mute(rpc: &mut Rpc) -> Result<bool> {
 
 const KEYD_SOCKET: &str = "/run/discord-mute-toggle.sock";
 
+enum Event {
+    /// Right Alt が押された
+    Toggle,
+    /// Discord の IPC ソケットができた (Discord が起動した)
+    DiscordStarted,
+}
+
 /// root 側の keyd から Right Alt 押下通知 (1 バイト) を受け取る。切れたら繋ぎ直す。
-fn spawn_keyd_reader(tx: Sender<()>) {
+fn spawn_keyd_reader(tx: Sender<Event>) {
     thread::spawn(move || {
         let mut warned = false;
         loop {
@@ -228,7 +243,7 @@ fn spawn_keyd_reader(tx: Sender<()>) {
                     let mut buf = [0u8; 64];
                     while let Ok(n @ 1..) = s.read(&mut buf) {
                         for _ in 0..n {
-                            if tx.send(()).is_err() {
+                            if tx.send(Event::Toggle).is_err() {
                                 return;
                             }
                         }
@@ -246,6 +261,29 @@ fn spawn_keyd_reader(tx: Sender<()>) {
     });
 }
 
+/// Discord の起動を inotify で待ち、起動したら先に接続しておく。
+/// 起動後最初のキー押下で接続・認証 (数百 ms) を待たずに済む。
+fn spawn_discord_watcher(tx: Sender<Event>) {
+    let dir = runtime_dir();
+    let inotify = match Inotify::watch(&dir, IN_CREATE) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{} を監視できない: {e}", dir.display());
+            return;
+        }
+    };
+    thread::spawn(move || {
+        while let Ok(names) = inotify.read_names() {
+            let started = names
+                .iter()
+                .any(|n| n.as_bytes().starts_with(b"discord-ipc-"));
+            if started && tx.send(Event::DiscordStarted).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 // ---------- main ----------
 
 fn load_config(path: &Path) -> Result<Config> {
@@ -257,45 +295,68 @@ fn main() -> Result<()> {
     let cfg = load_config(&config_dir().join("config.json"))?;
 
     let (tx, rx) = mpsc::channel();
-    spawn_keyd_reader(tx);
+    spawn_keyd_reader(tx.clone());
+    spawn_discord_watcher(tx);
 
-    let mut rpc = connect(&cfg)
-        .inspect_err(|e| eprintln!("Discord に接続できない: {e:#}"))
-        .ok();
-    if rpc.is_some() {
-        eprintln!("Discord に接続しました");
-    }
+    let mut rpc = try_connect(&cfg);
 
-    for () in rx {
-        // 接続が切れていたら (Discord 再起動など) 1 回だけ繋ぎ直して再試行する
-        for attempt in 0..2 {
-            if rpc.is_none() {
-                match connect(&cfg) {
-                    Ok(r) => rpc = Some(r),
-                    Err(e) => {
-                        eprintln!("Discord に接続できない: {e:#}");
+    for event in rx {
+        match event {
+            Event::DiscordStarted => {
+                // 起動直後はまだ RPC を受け付けないことがあるので、少し待ってから数回試す
+                rpc = None;
+                for _ in 0..5 {
+                    thread::sleep(Duration::from_secs(2));
+                    rpc = try_connect(&cfg);
+                    if rpc.is_some() {
                         break;
                     }
                 }
             }
-            match toggle_mute(rpc.as_mut().unwrap()) {
-                Ok(mute) => {
-                    eprintln!(
-                        "{}",
-                        if mute {
-                            "ミュート"
-                        } else {
-                            "ミュート解除"
-                        }
-                    );
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("トグル失敗 (試行 {}): {e:#}", attempt + 1);
-                    rpc = None;
-                }
-            }
+            Event::Toggle => toggle(&cfg, &mut rpc),
         }
     }
     Ok(())
+}
+
+fn try_connect(cfg: &Config) -> Option<Rpc> {
+    match connect(cfg) {
+        Ok(rpc) => {
+            eprintln!("Discord に接続しました");
+            Some(rpc)
+        }
+        Err(e) => {
+            eprintln!("Discord に接続できない: {e:#}");
+            None
+        }
+    }
+}
+
+fn toggle(cfg: &Config, rpc: &mut Option<Rpc>) {
+    // 接続が切れていたら (Discord 再起動など) 1 回だけ繋ぎ直して再試行する
+    for attempt in 0..2 {
+        if rpc.is_none() {
+            *rpc = try_connect(cfg);
+        }
+        let Some(r) = rpc.as_mut() else {
+            return;
+        };
+        match toggle_mute(r) {
+            Ok(mute) => {
+                eprintln!(
+                    "{}",
+                    if mute {
+                        "ミュート"
+                    } else {
+                        "ミュート解除"
+                    }
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("トグル失敗 (試行 {}): {e:#}", attempt + 1);
+                *rpc = None;
+            }
+        }
+    }
 }

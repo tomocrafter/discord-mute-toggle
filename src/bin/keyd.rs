@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 
+use discord_mute_toggle::inotify::{IN_ATTRIB, IN_CREATE, Inotify};
 use evdev::{Device, EventType, KeyCode};
 
 const TRIGGER_KEY: KeyCode = KeyCode::KEY_RIGHTALT;
@@ -118,18 +119,8 @@ fn is_event_node(name: &OsStr) -> bool {
 
 /// 起動時に一度だけ全デバイスを見て、以降は inotify で抜き差しに追従する。
 fn spawn_device_watcher(tx: Sender<()>) -> io::Result<()> {
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let inotify = unsafe { OwnedFd::from_raw_fd(fd) };
-    let dir = std::ffi::CString::new(INPUT_DIR).unwrap();
     // デバイスノードは root:root で作られ、直後に udev が input グループに変える (IN_ATTRIB)
-    let ret =
-        unsafe { libc::inotify_add_watch(fd, dir.as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let inotify = Inotify::watch(Path::new(INPUT_DIR), IN_CREATE | IN_ATTRIB)?;
 
     let opened = Opened::default();
     // watch を張ってから走査するので、その間に挿されたデバイスも取りこぼさない
@@ -140,35 +131,16 @@ fn spawn_device_watcher(tx: Sender<()>) -> io::Result<()> {
     }
 
     thread::spawn(move || {
-        // inotify_event は 4 バイト境界に揃っている必要がある
-        let mut buf = [0u32; 1024];
         loop {
-            let n = unsafe {
-                libc::read(
-                    inotify.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    size_of_val(&buf),
-                )
-            };
-            if n <= 0 {
-                eprintln!("inotify の読み取りに失敗: {}", io::Error::last_os_error());
-                return;
-            }
-            let bytes =
-                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n as usize) };
-            let mut off = 0;
-            while off < bytes.len() {
-                let ev = unsafe { &*bytes.as_ptr().add(off).cast::<libc::inotify_event>() };
-                let name_start = off + size_of::<libc::inotify_event>();
-                off = name_start + ev.len as usize;
-                let name = bytes[name_start..off]
-                    .split(|&b| b == 0)
-                    .next()
-                    .unwrap_or_default();
-                let name = OsStr::from_bytes(name);
-                if is_event_node(name) {
-                    try_open(&Path::new(INPUT_DIR).join(name), &tx, &opened);
+            let names = match inotify.read_names() {
+                Ok(names) => names,
+                Err(e) => {
+                    eprintln!("inotify の読み取りに失敗: {e}");
+                    return;
                 }
+            };
+            for name in names.iter().filter(|n| is_event_node(n)) {
+                try_open(&Path::new(INPUT_DIR).join(name), &tx, &opened);
             }
         }
     });
