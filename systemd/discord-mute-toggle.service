@@ -1,0 +1,12 @@
+[Unit]
+Description=Discord mute toggle on Right Alt (Wayland workaround)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/discord-mute-toggle
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

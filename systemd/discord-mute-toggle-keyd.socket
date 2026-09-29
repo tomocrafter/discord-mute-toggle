@@ -1,0 +1,11 @@
+[Unit]
+Description=Right Alt notifier socket for discord-mute-toggle
+
+[Socket]
+ListenStream=/run/discord-mute-toggle.sock
+# 通知を受け取れるのはこのユーザーだけ (install.sh が置換する)
+SocketUser=@USER@
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

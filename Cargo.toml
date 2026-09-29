@@ -1,0 +1,14 @@
+[package]
+name = "discord-mute-toggle"
+version = "0.1.0"
+edition = "2024"
+description = "Toggle Discord mic mute with Right Alt on Wayland, via Discord RPC"
+license = "MIT"
+repository = "https://github.com/tomocrafter/discord-mute-toggle"
+
+[dependencies]
+anyhow = "1.0.104"
+evdev = "0.13.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = { version = "3.4.2", features = ["json"] }

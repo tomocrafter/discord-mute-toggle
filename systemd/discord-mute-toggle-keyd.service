@@ -1,0 +1,37 @@
+[Unit]
+Description=Right Alt notifier for discord-mute-toggle (evdev reader)
+Requires=discord-mute-toggle-keyd.socket
+
+[Service]
+ExecStart=/usr/local/libexec/discord-mute-toggle-keyd
+Restart=on-failure
+
+# 使い捨てユーザー + input グループで /dev/input を読み取り専用で読むだけ
+DynamicUser=yes
+SupplementaryGroups=input
+DevicePolicy=closed
+DeviceAllow=char-input r
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
